@@ -1,0 +1,11 @@
+[package]
+name = "hop-store-sqlite"
+version.workspace = true
+edition.workspace = true
+license-file.workspace = true
+repository.workspace = true
+description = "Persistent SQLite Store backend for Hop (DESIGN.md §13.2)."
+
+[dependencies]
+hop-core.workspace = true
+rusqlite.workspace = true
