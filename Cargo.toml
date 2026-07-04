@@ -8,4 +8,12 @@ description = "Persistent SQLite Store backend for Hop (DESIGN.md §13.2)."
 
 [dependencies]
 hop-core.workspace = true
-rusqlite.workspace = true
+# F-25: rusqlite is declared locally (not via the workspace dep) so its bundling can be feature-gated:
+# `bundled` = plain SQLite (default, fast build); `sqlcipher` = SQLite + SQLCipher (encrypted at rest,
+# keyed via `SqliteStore::open_keyed`), which vendors OpenSSL and needs a C toolchain + perl to build.
+rusqlite = { version = "0.32", default-features = false }
+
+[features]
+default = ["bundled"]
+bundled = ["rusqlite/bundled"]
+sqlcipher = ["rusqlite/bundled-sqlcipher-vendored-openssl"]
