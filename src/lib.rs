@@ -71,7 +71,9 @@ impl SqliteStore {
         const SCHEMA_VERSION: i64 = 2;
         let uv: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         if uv != 0 && uv != SCHEMA_VERSION {
-            eprintln!("hop-store-sqlite: on-disk schema v{uv} != v{SCHEMA_VERSION}; resetting store");
+            eprintln!(
+                "hop-store-sqlite: on-disk schema v{uv} != v{SCHEMA_VERSION}; resetting store"
+            );
             conn.execute_batch(
                 "DROP TABLE IF EXISTS bundles; DROP TABLE IF EXISTS seen; DROP TABLE IF EXISTS kv;",
             )?;
@@ -102,7 +104,9 @@ impl SqliteStore {
     /// Keep the `seen` dedup table under [`MAX_SEEN_ROWS`] by evicting the nearest-to-expiry rows
     /// (F-07). Cheap: only runs the delete when the count is actually over the cap.
     fn enforce_seen_cap(&self) -> rusqlite::Result<()> {
-        let n: i64 = self.conn.query_row("SELECT COUNT(*) FROM seen", [], |r| r.get(0))?;
+        let n: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM seen", [], |r| r.get(0))?;
         if n > MAX_SEEN_ROWS {
             self.conn.execute(
                 "DELETE FROM seen WHERE id IN \
@@ -169,13 +173,19 @@ impl Store for SqliteStore {
 
     fn seen(&self, id: &BundleId) -> bool {
         self.conn
-            .query_row("SELECT 1 FROM seen WHERE id = ?1", params![&id[..]], |_| Ok(()))
+            .query_row("SELECT 1 FROM seen WHERE id = ?1", params![&id[..]], |_| {
+                Ok(())
+            })
             .is_ok()
     }
 
     fn contains(&self, id: &BundleId) -> bool {
         self.conn
-            .query_row("SELECT 1 FROM bundles WHERE id = ?1", params![&id[..]], |_| Ok(()))
+            .query_row(
+                "SELECT 1 FROM bundles WHERE id = ?1",
+                params![&id[..]],
+                |_| Ok(()),
+            )
             .is_ok()
     }
 
@@ -200,9 +210,10 @@ impl Store for SqliteStore {
             "DELETE FROM bundles WHERE id IN (SELECT id FROM seen WHERE expires_at <= ?1)",
             params![now_ms as i64],
         );
-        let _ = self
-            .conn
-            .execute("DELETE FROM seen WHERE expires_at <= ?1", params![now_ms as i64]);
+        let _ = self.conn.execute(
+            "DELETE FROM seen WHERE expires_at <= ?1",
+            params![now_ms as i64],
+        );
     }
 
     fn split_copies(&mut self, id: &BundleId) -> u16 {
@@ -225,18 +236,25 @@ impl Store for SqliteStore {
 
     fn get_kv(&self, key: &str) -> Option<Vec<u8>> {
         self.conn
-            .query_row("SELECT value FROM kv WHERE key = ?1", params![key], |r| r.get::<_, Vec<u8>>(0))
+            .query_row("SELECT value FROM kv WHERE key = ?1", params![key], |r| {
+                r.get::<_, Vec<u8>>(0)
+            })
             .ok()
     }
 
     fn remove_kv(&mut self, key: &str) {
-        let _ = self.conn.execute("DELETE FROM kv WHERE key = ?1", params![key]);
+        let _ = self
+            .conn
+            .execute("DELETE FROM kv WHERE key = ?1", params![key]);
     }
 
     fn list_kv(&self, prefix: &str) -> Vec<(String, Vec<u8>)> {
         // `prefix%` with the LIKE wildcard; prefixes here are fixed ("session/"), no escaping.
         let pattern = format!("{prefix}%");
-        let Ok(mut stmt) = self.conn.prepare("SELECT key, value FROM kv WHERE key LIKE ?1") else {
+        let Ok(mut stmt) = self
+            .conn
+            .prepare("SELECT key, value FROM kv WHERE key LIKE ?1")
+        else {
             return Vec::new();
         };
         let rows = stmt.query_map(params![pattern], |r| {
@@ -268,8 +286,14 @@ mod tests {
             &from,
             Destination::Device(to.address()),
             &to.address(),
-            &Payload::PeerMessage { content_type: "t".into(), body: b"persist me".to_vec() },
-            BundleOpts { copies, ..Default::default() },
+            &Payload::PeerMessage {
+                content_type: "t".into(),
+                body: b"persist me".to_vec(),
+            },
+            BundleOpts {
+                copies,
+                ..Default::default()
+            },
         )
         .unwrap()
     }
@@ -314,7 +338,10 @@ mod tests {
 
     #[test]
     fn survives_reopen() {
-        let path = format!("{}/hop-sqlite-reopen-test.db", std::env::temp_dir().display());
+        let path = format!(
+            "{}/hop-sqlite-reopen-test.db",
+            std::env::temp_dir().display()
+        );
         let _ = std::fs::remove_file(&path);
 
         let b = sample(8);
@@ -341,8 +368,14 @@ mod tests {
             &from,
             Destination::Device(to.address()),
             &to.address(),
-            &Payload::PeerMessage { content_type: "t".into(), body: vec![1] },
-            BundleOpts { lifetime_ms: 1_000, ..Default::default() },
+            &Payload::PeerMessage {
+                content_type: "t".into(),
+                body: vec![1],
+            },
+            BundleOpts {
+                lifetime_ms: 1_000,
+                ..Default::default()
+            },
         )
         .unwrap();
         let id = b.id();
@@ -351,7 +384,10 @@ mod tests {
         s.prune(500);
         assert!(s.seen(&id) && s.contains(&id));
         s.prune(2_000);
-        assert!(!s.seen(&id) && !s.contains(&id), "window closed, entry pruned");
+        assert!(
+            !s.seen(&id) && !s.contains(&id),
+            "window closed, entry pruned"
+        );
         assert!(s.put(b, 2_000), "re-accepted after window");
     }
 
@@ -366,15 +402,24 @@ mod tests {
             &from,
             Destination::Device(to.address()),
             &to.address(),
-            &Payload::PeerMessage { content_type: "t".into(), body: vec![1] },
-            BundleOpts { lifetime_ms: u32::MAX, ..Default::default() }, // hostile: ~49 days
+            &Payload::PeerMessage {
+                content_type: "t".into(),
+                body: vec![1],
+            },
+            BundleOpts {
+                lifetime_ms: u32::MAX,
+                ..Default::default()
+            }, // hostile: ~49 days
         )
         .unwrap();
         let id = b.id();
         s.put(b, 0);
         // Just past the clamp, the dedup row is gone (would still be present if lifetime_ms won).
         s.prune(MAX_SEEN_LIFETIME_MS + 1);
-        assert!(!s.seen(&id), "seen row must be clamped to the max window, not the claimed lifetime");
+        assert!(
+            !s.seen(&id),
+            "seen row must be clamped to the max window, not the claimed lifetime"
+        );
     }
 
     #[cfg(feature = "sqlcipher")]
@@ -391,8 +436,14 @@ mod tests {
             let mut s = SqliteStore::open_keyed(&path, &key).unwrap();
             assert!(s.put(b, 0));
         }
-        assert!(SqliteStore::open(&path).is_err(), "plain (unkeyed) open of an encrypted db must fail");
-        assert!(SqliteStore::open_keyed(&path, &[9u8; 32]).is_err(), "wrong key must fail");
+        assert!(
+            SqliteStore::open(&path).is_err(),
+            "plain (unkeyed) open of an encrypted db must fail"
+        );
+        assert!(
+            SqliteStore::open_keyed(&path, &[9u8; 32]).is_err(),
+            "wrong key must fail"
+        );
         let s = SqliteStore::open_keyed(&path, &key).unwrap();
         assert!(s.contains(&id), "the right key decrypts and reads the data");
         let _ = std::fs::remove_file(&path);
@@ -402,7 +453,10 @@ mod tests {
     fn incompatible_schema_version_resets_the_store() {
         // D7: a db stamped with an older schema version is reset on open, so old-encoding rows are
         // never silently misread. (A matching version leaves data intact — covered by survives_reopen.)
-        let path = format!("{}/hop-sqlite-schema-test.db", std::env::temp_dir().display());
+        let path = format!(
+            "{}/hop-sqlite-schema-test.db",
+            std::env::temp_dir().display()
+        );
         let _ = std::fs::remove_file(&path);
         let b = sample(8);
         let id = b.id();
@@ -413,7 +467,10 @@ mod tests {
             s.conn.pragma_update(None, "user_version", 1i64).unwrap();
         }
         let s = SqliteStore::open(&path).unwrap();
-        assert!(!s.contains(&id), "an incompatible-version db is reset (rows dropped)");
+        assert!(
+            !s.contains(&id),
+            "an incompatible-version db is reset (rows dropped)"
+        );
         assert!(!s.seen(&id), "seen table reset too");
         let _ = std::fs::remove_file(&path);
     }
@@ -427,14 +484,21 @@ mod tests {
             &sender,
             Destination::Device(you.address()),
             &you.address(),
-            &Payload::PeerMessage { content_type: "t".into(), body: b"hi".to_vec() },
+            &Payload::PeerMessage {
+                content_type: "t".into(),
+                body: b"hi".to_vec(),
+            },
             BundleOpts::default(),
         )
         .unwrap();
         let bid = bundle.id();
 
-        let mut node = Node::with_store(Identity::generate(), SqliteStore::open_in_memory().unwrap());
+        let mut node =
+            Node::with_store(Identity::generate(), SqliteStore::open_in_memory().unwrap());
         node.submit(bundle);
-        assert!(node.store.contains(&bid), "submitted bundle is in the sqlite store");
+        assert!(
+            node.store.contains(&bid),
+            "submitted bundle is in the sqlite store"
+        );
     }
 }
