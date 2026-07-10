@@ -12,6 +12,9 @@ hop-core.workspace = true
 # `bundled` = plain SQLite (default, fast build); `sqlcipher` = SQLite + SQLCipher (encrypted at rest,
 # keyed via `SqliteStore::open_keyed`), which vendors OpenSSL and needs a C toolchain + perl to build.
 rusqlite = { version = "0.32", default-features = false }
+# stores-12: zeroize the hex-formatted SQLCipher key material after the PRAGMA runs, so the
+# at-rest key does not linger in unzeroized heap allocations for the process lifetime.
+zeroize = "1"
 
 [features]
 default = ["bundled"]

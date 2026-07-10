@@ -18,6 +18,36 @@
 use hop_core::bundle::{Bundle, BundleId};
 use hop_core::store::{HaveSet, Store};
 use rusqlite::{params, Connection};
+use zeroize::Zeroize;
+
+/// stores-12: format the raw key bytes as lowercase hex into a heap `String` that is zeroized on
+/// drop. The at-rest SQLCipher key would otherwise linger in an unzeroized allocation for the
+/// process lifetime; wrapping it means the hex spelling is wiped as soon as it goes out of scope.
+struct HexKey(String);
+
+impl HexKey {
+    fn new(key: &[u8]) -> Self {
+        let mut hex = String::with_capacity(key.len() * 2);
+        for b in key {
+            // Manual nibble->hex so we never route the bytes through a throwaway `format!`
+            // allocation that we couldn't zeroize.
+            const NIBBLES: &[u8; 16] = b"0123456789abcdef";
+            hex.push(NIBBLES[(b >> 4) as usize] as char);
+            hex.push(NIBBLES[(b & 0x0f) as usize] as char);
+        }
+        HexKey(hex)
+    }
+
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Drop for HexKey {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
+}
 
 /// Hard cap on how long a `seen` dedup row is retained, regardless of a bundle's claimed
 /// `lifetime_ms` (F-07). The field is attacker-controlled (a `u32` ms, ~49 days max) and, for an
@@ -33,6 +63,10 @@ const MAX_SEEN_ROWS: i64 = 200_000;
 /// A SQLite-backed bundle store.
 pub struct SqliteStore {
     conn: Connection,
+    /// stores-10: in-memory count of `seen` rows so `put` does not run `SELECT COUNT(*)` (a full
+    /// table scan) on every insert under the node Mutex. Seeded once at open, then kept in step with
+    /// every insert/evict/prune.
+    seen_rows: std::cell::Cell<i64>,
 }
 
 impl SqliteStore {
@@ -51,10 +85,67 @@ impl SqliteStore {
         if !key.is_empty() {
             // SQLCipher raw-key form: `PRAGMA key = "x'<hex>'"` uses the bytes directly. Must run
             // BEFORE any table access (from_conn), which SQLCipher requires to derive the page cipher.
-            let hex: String = key.iter().map(|b| format!("{b:02x}")).collect();
-            conn.execute_batch(&format!("PRAGMA key = \"x'{hex}'\";"))?;
+            // stores-12: both the hex spelling and the assembled PRAGMA text are zeroized after use.
+            let hex = HexKey::new(key);
+            let mut pragma = format!("PRAGMA key = \"x'{}'\";", hex.as_str());
+            let res = conn.execute_batch(&pragma);
+            pragma.zeroize();
+            res?;
         }
         Self::from_conn(conn)
+    }
+
+    /// True iff the file at `path` opens as an UNENCRYPTED SQLite database (its header reads as a
+    /// plain db). Used to tell "existing plaintext db, we now have a key" (migrate) apart from
+    /// "wrong key / genuine corruption" (fail closed) so a keyed open never silently wipes state.
+    /// Without the `sqlcipher` feature `PRAGMA key` is a no-op, so a keyed open of a plain file
+    /// already succeeds and this path is not exercised.
+    pub fn opens_as_plaintext(path: &str) -> bool {
+        if !std::path::Path::new(path).exists() {
+            return false;
+        }
+        // A plain (unkeyed) open that can read the schema means the bytes are an unencrypted db.
+        Connection::open(path)
+            .and_then(|c| {
+                c.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))?;
+                Ok(())
+            })
+            .is_ok()
+    }
+
+    /// Migrate an existing PLAINTEXT db at `path` to a SQLCipher-encrypted db keyed with `key`,
+    /// in place, via `sqlcipher_export` (the standard SQLCipher plaintext->encrypted recipe): open
+    /// the plain db, ATTACH a fresh keyed sidecar, export into it, then atomically replace the
+    /// original. Preserves all rows (sessions, prekeys, queued sends) instead of wiping them.
+    #[cfg(feature = "sqlcipher")]
+    pub fn migrate_plaintext_to_keyed(path: &str, key: &[u8]) -> rusqlite::Result<Self> {
+        if key.is_empty() {
+            return Self::open_keyed(path, key); // nothing to encrypt to
+        }
+        let sidecar = format!("{path}.migrating");
+        let _ = std::fs::remove_file(&sidecar);
+        // stores-12: hex spelling zeroized on drop; the assembled ATTACH batch is zeroized after use.
+        let hex = HexKey::new(key);
+        {
+            let conn = Connection::open(path)?; // plaintext source
+            let mut batch = format!(
+                "ATTACH DATABASE '{sidecar}' AS enc KEY \"x'{}'\";\
+                 SELECT sqlcipher_export('enc');\
+                 DETACH DATABASE enc;",
+                hex.as_str()
+            );
+            let res = conn.execute_batch(&batch);
+            batch.zeroize();
+            res?;
+        } // conn dropped -> sidecar flushed + closed
+          // Atomically replace the plaintext original with the encrypted sidecar.
+        std::fs::rename(&sidecar, path).map_err(|e| {
+            rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_IOERR),
+                Some(format!("sqlcipher migrate rename failed: {e}")),
+            )
+        })?;
+        Self::open_keyed(path, key)
     }
 
     /// Open an ephemeral in-memory store (for tests).
@@ -64,19 +155,37 @@ impl SqliteStore {
 
     fn from_conn(conn: Connection) -> rusqlite::Result<Self> {
         // D7: schema/format version, tracked in SQLite's built-in `user_version`. Bump on any
-        // incompatible on-disk change (table shape OR row encoding). v2 = the §39 wire change (F-06):
-        // pre-v2 rows are a different postcard layout, so an old db is RESET rather than silently
-        // misread. Pre-prod (iterate-freely), so a clean reset is acceptable; a real migration keyed
-        // on the old `user_version` would go here. A fresh db (user_version 0) just adopts the current.
+        // incompatible on-disk change (table shape OR row encoding). A fresh db (user_version 0)
+        // just adopts the current version.
+        //
+        // stores-06: migrate keyed on the OLD `user_version` instead of amnesia-ing the whole store.
+        // The only incompatible bump to date (v1 -> v2, the §39 wire change F-06) re-encodes the
+        // `bundles`/`seen` rows but does NOT touch the `kv` schema. `kv` holds the device's durable,
+        // wire-format-INDEPENDENT state: forward-secret ratchet sessions, prekey secrets, the queued
+        // send buffer, and hosted hps keys. Dropping those forced a full re-secure with every peer
+        // (historically the fragile path) and lost queued sends on every upgrade. So we drop only the
+        // wire-format-dependent tables and PRESERVE `kv`. An unrecognized (future/older) version we
+        // can't migrate still falls back to a clean reset rather than risk a silent misread.
         const SCHEMA_VERSION: i64 = 2;
         let uv: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         if uv != 0 && uv != SCHEMA_VERSION {
-            eprintln!(
-                "hop-store-sqlite: on-disk schema v{uv} != v{SCHEMA_VERSION}; resetting store"
-            );
-            conn.execute_batch(
-                "DROP TABLE IF EXISTS bundles; DROP TABLE IF EXISTS seen; DROP TABLE IF EXISTS kv;",
-            )?;
+            if uv == 1 {
+                // v1 -> v2: only the bundle/seen row encoding changed; keep `kv` intact.
+                eprintln!(
+                    "hop-store-sqlite: migrating schema v{uv} -> v{SCHEMA_VERSION} \
+                     (re-encoding bundles/seen; preserving kv sessions/queued sends)"
+                );
+                conn.execute_batch("DROP TABLE IF EXISTS bundles; DROP TABLE IF EXISTS seen;")?;
+            } else {
+                // No migration known for this version pair: reset rather than risk misreading rows.
+                eprintln!(
+                    "hop-store-sqlite: on-disk schema v{uv} has no migration to v{SCHEMA_VERSION}; \
+                     resetting store"
+                );
+                conn.execute_batch(
+                    "DROP TABLE IF EXISTS bundles; DROP TABLE IF EXISTS seen; DROP TABLE IF EXISTS kv;",
+                )?;
+            }
         }
         // Performance-critical: the node holds its single Mutex across every store write, so each
         // write's fsync stalls ALL node processing (link Noise handshakes, prekey gossip, sends).
@@ -94,25 +203,48 @@ impl SqliteStore {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS bundles (id BLOB PRIMARY KEY, data BLOB NOT NULL);
              CREATE TABLE IF NOT EXISTS seen (id BLOB PRIMARY KEY, expires_at INTEGER NOT NULL);
-             CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value BLOB NOT NULL);",
+             CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value BLOB NOT NULL);
+             -- stores-10: index expires_at so the cap-eviction ORDER BY and both prune predicates
+             -- (WHERE expires_at <= ?) are index range scans, not full-table scans under the Mutex.
+             CREATE INDEX IF NOT EXISTS idx_seen_expires_at ON seen (expires_at);",
         )?;
         // D7: stamp the current schema/format version so a future incompatible bump is detected.
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-        Ok(Self { conn })
+        // stores-10: seed the in-memory row count once (the only COUNT(*) we run) so puts never scan.
+        let seen_rows: i64 = conn.query_row("SELECT COUNT(*) FROM seen", [], |r| r.get(0))?;
+        Ok(Self {
+            conn,
+            seen_rows: std::cell::Cell::new(seen_rows),
+        })
     }
 
     /// Keep the `seen` dedup table under [`MAX_SEEN_ROWS`] by evicting the nearest-to-expiry rows
-    /// (F-07). Cheap: only runs the delete when the count is actually over the cap.
+    /// (F-07). Cheap: only runs the delete when the count is actually over the cap. Any held bundle
+    /// for an evicted id is deleted in the same step (stores-04): prune deletes bundles only via the
+    /// `seen` join, so an evicted seen row would otherwise orphan its bundle past its lifetime.
     fn enforce_seen_cap(&self) -> rusqlite::Result<()> {
-        let n: i64 = self
-            .conn
-            .query_row("SELECT COUNT(*) FROM seen", [], |r| r.get(0))?;
+        // stores-10: gate on the tracked count so the common case (under the cap) does no query at
+        // all - the previous per-put `SELECT COUNT(*)` was a full-table scan under the node Mutex.
+        let n = self.seen_rows.get();
         if n > MAX_SEEN_ROWS {
-            self.conn.execute(
-                "DELETE FROM seen WHERE id IN \
-                 (SELECT id FROM seen ORDER BY expires_at ASC LIMIT ?1)",
-                params![n - MAX_SEEN_ROWS],
-            )?;
+            // Materialize the victim ids once so we delete the same set from both tables. The
+            // ORDER BY now rides idx_seen_expires_at instead of scanning + sorting the whole table.
+            let victims: Vec<Vec<u8>> = {
+                let mut stmt = self
+                    .conn
+                    .prepare("SELECT id FROM seen ORDER BY expires_at ASC LIMIT ?1")?;
+                let rows =
+                    stmt.query_map(params![n - MAX_SEEN_ROWS], |r| r.get::<_, Vec<u8>>(0))?;
+                rows.filter_map(|r| r.ok()).collect()
+            };
+            for id in &victims {
+                self.conn
+                    .execute("DELETE FROM bundles WHERE id = ?1", params![id])?;
+                let removed = self
+                    .conn
+                    .execute("DELETE FROM seen WHERE id = ?1", params![id])?;
+                self.seen_rows.set(self.seen_rows.get() - removed as i64);
+            }
         }
         Ok(())
     }
@@ -141,14 +273,30 @@ impl Store for SqliteStore {
         // unauthenticated) lifetime_ms can't pin a `seen` row open for weeks (F-07).
         let lifetime = (bundle.inner.lifetime_ms as u64).min(MAX_SEEN_LIFETIME_MS);
         let expires_at = now_ms.saturating_add(lifetime);
-        let result = (|| -> rusqlite::Result<()> {
-            self.conn.execute(
+        // Transactional (stores-03): the seen row and the bundle write must commit together. Without
+        // this, a failed bundle write (disk full, encode error) would leave the id poisoned in `seen`
+        // for up to a week, permanently rejecting every re-offer of a bundle we never actually stored.
+        let result = (|| -> rusqlite::Result<usize> {
+            let tx = self.conn.transaction()?;
+            let inserted = tx.execute(
                 "INSERT OR IGNORE INTO seen (id, expires_at) VALUES (?1, ?2)",
                 params![&id[..], expires_at as i64],
             )?;
-            self.enforce_seen_cap()?;
-            self.write_data(&id, &bundle)
+            let data = bundle.to_bytes().map_err(to_sqlite_err)?;
+            tx.execute(
+                "INSERT OR REPLACE INTO bundles (id, data) VALUES (?1, ?2)",
+                params![&id[..], data],
+            )?;
+            tx.commit()?;
+            Ok(inserted)
         })();
+        // stores-10: keep the tracked count in step with the actual seen insert (0 if the id was
+        // already present) so cap enforcement never runs a COUNT(*). Only bump on a committed tx.
+        if let Ok(inserted) = result {
+            self.seen_rows.set(self.seen_rows.get() + inserted as i64);
+        }
+        // Cap enforcement is a separate best-effort maintenance step outside the put transaction.
+        let _ = self.enforce_seen_cap();
         result.is_ok()
     }
 
@@ -210,10 +358,13 @@ impl Store for SqliteStore {
             "DELETE FROM bundles WHERE id IN (SELECT id FROM seen WHERE expires_at <= ?1)",
             params![now_ms as i64],
         );
-        let _ = self.conn.execute(
+        // stores-10: both deletes now ride idx_seen_expires_at; keep the tracked count in step.
+        if let Ok(removed) = self.conn.execute(
             "DELETE FROM seen WHERE expires_at <= ?1",
             params![now_ms as i64],
-        );
+        ) {
+            self.seen_rows.set(self.seen_rows.get() - removed as i64);
+        }
     }
 
     fn split_copies(&mut self, id: &BundleId) -> u16 {
@@ -422,6 +573,47 @@ mod tests {
         );
     }
 
+    #[test]
+    fn seen_cap_evicts_bundle_with_its_seen_row() {
+        // stores-04: when the seen cap evicts a row, its held bundle must go too, or prune (which
+        // joins on seen) can never reclaim it and it outlives its lifetime on disk.
+        let mut s = SqliteStore::open_in_memory().unwrap();
+        // Insert one real held bundle with a near expiry so it is the eviction target.
+        let b = sample(8);
+        let id = b.id();
+        s.put(b, 0);
+        // Directly stuff the seen table past the cap with far-future expiries so our real bundle's
+        // seen row (expiry = default lifetime) is among the nearest-to-expiry and gets evicted.
+        {
+            let tx = s.conn.transaction().unwrap();
+            for i in 0..(MAX_SEEN_ROWS + 10) {
+                let mut fake = [0u8; 32];
+                fake[..8].copy_from_slice(&(i as u64 + 1).to_le_bytes());
+                fake[31] = 0xAA; // avoid colliding with the real id namespace
+                tx.execute(
+                    "INSERT OR IGNORE INTO seen (id, expires_at) VALUES (?1, ?2)",
+                    params![&fake[..], i64::MAX],
+                )
+                .unwrap();
+            }
+            tx.commit().unwrap();
+        }
+        // The direct INSERTs above bypass put()'s tracked count; re-seed it from the table so the
+        // cap gate reflects the rows we just stuffed in (matches the from_conn seed at open time).
+        s.seen_rows.set(
+            s.conn
+                .query_row("SELECT COUNT(*) FROM seen", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+        );
+        s.enforce_seen_cap().unwrap();
+        // The real bundle's seen row (nearest expiry) was evicted; its held bundle must be gone too.
+        assert!(!s.seen(&id), "seen row evicted under the cap");
+        assert!(
+            !s.contains(&id),
+            "held bundle must be evicted with its seen row, not orphaned"
+        );
+    }
+
     #[cfg(feature = "sqlcipher")]
     #[test]
     fn sqlcipher_encrypts_at_rest() {
@@ -449,10 +641,42 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    #[cfg(feature = "sqlcipher")]
     #[test]
-    fn incompatible_schema_version_resets_the_store() {
-        // D7: a db stamped with an older schema version is reset on open, so old-encoding rows are
-        // never silently misread. (A matching version leaves data intact — covered by survives_reopen.)
+    fn plaintext_db_migrates_to_keyed_without_losing_data() {
+        // android-01: an existing PLAINTEXT hop.db plus a newly-supplied key must migrate in place
+        // (plaintext -> SQLCipher) preserving every row, never wipe. Proves the recovery path the
+        // config-divergence fix relies on for already-installed devices.
+        let path = format!("{}/hop-migrate-test.db", std::env::temp_dir().display());
+        let _ = std::fs::remove_file(&path);
+        let key = [5u8; 32];
+        let b = sample(11);
+        let id = b.id();
+        {
+            let mut plain = SqliteStore::open(&path).unwrap(); // unencrypted, with data
+            assert!(plain.put(b, 0));
+        }
+        assert!(
+            SqliteStore::opens_as_plaintext(&path),
+            "starts as a plain db"
+        );
+        let migrated = SqliteStore::migrate_plaintext_to_keyed(&path, &key).unwrap();
+        assert!(migrated.contains(&id), "data survives the migration");
+        assert!(
+            SqliteStore::open(&path).is_err(),
+            "after migration a plain open fails — it is now SQLCipher-encrypted"
+        );
+        assert!(
+            !SqliteStore::opens_as_plaintext(&path),
+            "no longer readable as plaintext"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn v1_to_v2_migration_drops_bundles_but_preserves_kv() {
+        // stores-06: a v1 db migrated to v2 re-encodes bundles/seen (the §39 wire change) but must
+        // PRESERVE `kv` (ratchet sessions, prekey secrets, queued sends), not amnesia the device.
         let path = format!(
             "{}/hop-sqlite-schema-test.db",
             std::env::temp_dir().display()
@@ -463,16 +687,142 @@ mod tests {
         {
             let mut s = SqliteStore::open(&path).unwrap();
             s.put(b, 0);
-            // Simulate an older on-disk schema.
+            s.put_kv("session/peerX", b"ratchet-state".to_vec()); // durable device state
+                                                                  // Simulate an older (v1) on-disk schema.
             s.conn.pragma_update(None, "user_version", 1i64).unwrap();
         }
         let s = SqliteStore::open(&path).unwrap();
         assert!(
             !s.contains(&id),
-            "an incompatible-version db is reset (rows dropped)"
+            "wire-format-dependent bundle rows are dropped on the v1->v2 migration"
         );
-        assert!(!s.seen(&id), "seen table reset too");
+        assert!(!s.seen(&id), "seen table dropped too (re-encoded)");
+        assert_eq!(
+            s.get_kv("session/peerX"),
+            Some(b"ratchet-state".to_vec()),
+            "kv (sessions/queued sends) survives the migration"
+        );
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn unknown_schema_version_resets_the_whole_store() {
+        // stores-06: a version pair with no known migration still falls back to a clean reset (kv
+        // included) rather than risk silently misreading rows.
+        let path = format!(
+            "{}/hop-sqlite-schema-unknown-test.db",
+            std::env::temp_dir().display()
+        );
+        let _ = std::fs::remove_file(&path);
+        {
+            let mut s = SqliteStore::open(&path).unwrap();
+            s.put_kv("session/peerX", b"ratchet-state".to_vec());
+            // A version we have no migration for.
+            s.conn.pragma_update(None, "user_version", 99i64).unwrap();
+        }
+        let s = SqliteStore::open(&path).unwrap();
+        assert_eq!(
+            s.get_kv("session/peerX"),
+            None,
+            "an unknown-version db is fully reset (kv dropped)"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn tracked_seen_count_stays_in_step_with_the_table() {
+        // stores-10: the in-memory seen_rows count must match COUNT(*) across put (new + dup),
+        // prune, and reopen - it is what gates cap enforcement without a per-put full scan.
+        let path = format!(
+            "{}/hop-sqlite-count-test.db",
+            std::env::temp_dir().display()
+        );
+        let _ = std::fs::remove_file(&path);
+        let true_count = |s: &SqliteStore| -> i64 {
+            s.conn
+                .query_row("SELECT COUNT(*) FROM seen", [], |r| r.get::<_, i64>(0))
+                .unwrap()
+        };
+        {
+            let mut s = SqliteStore::open(&path).unwrap();
+            assert_eq!(s.seen_rows.get(), 0);
+
+            let a = sample(4);
+            let a_bundle = a.clone();
+            s.put(a, 0);
+            assert_eq!(s.seen_rows.get(), 1);
+            // A duplicate does not bump the count (INSERT OR IGNORE inserted 0 rows).
+            s.put(a_bundle, 0);
+            assert_eq!(s.seen_rows.get(), 1);
+            assert_eq!(s.seen_rows.get(), true_count(&s));
+
+            // A short-lived bundle we can prune out.
+            let from = Identity::generate();
+            let to = Identity::generate();
+            let short = Bundle::create(
+                &from,
+                Destination::Device(to.address()),
+                &to.address(),
+                &Payload::PeerMessage {
+                    content_type: "t".into(),
+                    body: vec![9],
+                },
+                BundleOpts {
+                    lifetime_ms: 1_000,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            s.put(short, 0);
+            assert_eq!(s.seen_rows.get(), 2);
+            s.prune(2_000); // drops the short-lived seen row only
+            assert_eq!(s.seen_rows.get(), 1);
+            assert_eq!(s.seen_rows.get(), true_count(&s));
+        }
+        // Reopen re-seeds the count from the table (the one COUNT(*) we ever run).
+        let s = SqliteStore::open(&path).unwrap();
+        assert_eq!(s.seen_rows.get(), 1);
+        assert_eq!(s.seen_rows.get(), true_count(&s));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn seen_expires_at_index_exists() {
+        // stores-10: the expires_at index must be created so prune predicates and the cap-eviction
+        // ORDER BY are index scans, not full-table scans under the node Mutex.
+        let s = SqliteStore::open_in_memory().unwrap();
+        let has_index: bool = s
+            .conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_seen_expires_at'",
+                [],
+                |_| Ok(()),
+            )
+            .is_ok();
+        assert!(has_index, "idx_seen_expires_at must exist");
+    }
+
+    #[test]
+    fn hex_key_wipes_the_backing_buffer() {
+        // stores-12: the hex spelling of the at-rest key must be zeroized, not left lingering in a
+        // heap allocation. We drive the exact wipe that Drop performs (String::zeroize) in place,
+        // while the allocation is still owned by us, and read the SAME backing buffer through a raw
+        // pointer captured before the wipe. This proves the volatile zeroing actually cleared the
+        // bytes, without the UB of reading a freed allocation.
+        let key = [0xABu8; 32];
+        let mut hex = HexKey::new(&key);
+        assert_eq!(hex.as_str(), "ab".repeat(32));
+        let ptr = hex.0.as_ptr();
+        let len = hex.0.len();
+        hex.0.zeroize(); // same call the Drop impl makes; buffer stays allocated (owned by us)
+                         // Safe: `hex` (and thus its backing allocation) is still alive for this read.
+        let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
+        assert!(
+            bytes.iter().all(|&b| b == 0),
+            "hex key material must be zeroized, found non-zero bytes"
+        );
+        // And the exact same wipe happens automatically on drop.
+        drop(hex);
     }
 
     #[test]
