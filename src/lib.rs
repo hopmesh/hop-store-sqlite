@@ -124,10 +124,25 @@ impl SqliteStore {
         }
         let sidecar = format!("{path}.migrating");
         let _ = std::fs::remove_file(&sidecar);
+        // stores-r2-02: the sidecar itself may also carry stale WAL/SHM from a crashed prior attempt.
+        let _ = std::fs::remove_file(format!("{sidecar}-wal"));
+        let _ = std::fs::remove_file(format!("{sidecar}-shm"));
         // stores-12: hex spelling zeroized on drop; the assembled ATTACH batch is zeroized after use.
         let hex = HexKey::new(key);
         {
             let conn = Connection::open(path)?; // plaintext source
+                                                // stores-r2-02: the plaintext db was created via from_conn, which sets journal_mode=WAL,
+                                                // so `{path}-wal`/`{path}-shm` sidecars exist beside it. If we rename only the main file
+                                                // over the destination, those plaintext WAL/SHM files are left orphaned next to the new
+                                                // SQLCipher db; when open_keyed re-enables WAL, SQLite can try to recover against a -wal
+                                                // that belongs to a DIFFERENT (unencrypted) database -> open failure or corruption on the
+                                                // exact already-installed devices this migration exists to protect. Checkpoint and switch
+                                                // the source to journal_mode=DELETE so it folds the WAL back into the main file and drops
+                                                // the sidecars BEFORE we export + rename. (No-op if the source was never WAL.)
+            conn.execute_batch(
+                "PRAGMA wal_checkpoint(TRUNCATE);
+                 PRAGMA journal_mode=DELETE;",
+            )?;
             let mut batch = format!(
                 "ATTACH DATABASE '{sidecar}' AS enc KEY \"x'{}'\";\
                  SELECT sqlcipher_export('enc');\
@@ -145,6 +160,11 @@ impl SqliteStore {
                 Some(format!("sqlcipher migrate rename failed: {e}")),
             )
         })?;
+        // stores-r2-02: belt-and-suspenders. Remove any plaintext WAL/SHM that lingered (e.g. the
+        // journal_mode switch was a no-op on an older SQLite, or a sidecar the checkpoint didn't
+        // fold). These belong to the now-gone plaintext db; the new SQLCipher db will create its own.
+        let _ = std::fs::remove_file(format!("{path}-wal"));
+        let _ = std::fs::remove_file(format!("{path}-shm"));
         Self::open_keyed(path, key)
     }
 
@@ -237,14 +257,23 @@ impl SqliteStore {
                     stmt.query_map(params![n - MAX_SEEN_ROWS], |r| r.get::<_, Vec<u8>>(0))?;
                 rows.filter_map(|r| r.ok()).collect()
             };
+            // stores-r2-04: evict from `bundles` and `seen` inside ONE transaction, matching put()'s
+            // atomicity. Previously each victim did two separate un-enclosed DELETEs and bumped
+            // `seen_rows` only after the seen delete; a mid-loop failure (bundles deleted, seen delete
+            // errors, or vice versa) drifted the tracked count from the table and could orphan a
+            // held bundle without its seen row (or a seen row without its bundle) until reopen
+            // re-seeded the count. Now either every victim is removed from both tables or none is, and
+            // `seen_rows` is decremented only from the COMMITTED seen-delete count. `unchecked_`
+            // because enforce runs behind `&self` (interior-mutable count); the node Mutex serializes
+            // all store access, so there is no concurrent writer on this single connection.
+            let tx = self.conn.unchecked_transaction()?;
+            let mut removed_total: i64 = 0;
             for id in &victims {
-                self.conn
-                    .execute("DELETE FROM bundles WHERE id = ?1", params![id])?;
-                let removed = self
-                    .conn
-                    .execute("DELETE FROM seen WHERE id = ?1", params![id])?;
-                self.seen_rows.set(self.seen_rows.get() - removed as i64);
+                tx.execute("DELETE FROM bundles WHERE id = ?1", params![id])?;
+                removed_total += tx.execute("DELETE FROM seen WHERE id = ?1", params![id])? as i64;
             }
+            tx.commit()?;
+            self.seen_rows.set(self.seen_rows.get() - removed_total);
         }
         Ok(())
     }
@@ -823,6 +852,270 @@ mod tests {
         );
         // And the exact same wipe happens automatically on drop.
         drop(hex);
+    }
+
+    #[test]
+    fn seen_cap_eviction_keeps_tracked_count_in_step_and_never_orphans() {
+        // stores-r2-04: the cap eviction now runs its two-table DELETEs inside ONE transaction.
+        // After it runs, the tracked seen_rows MUST equal COUNT(*) (no drift), and no held bundle may
+        // be left without its seen row (nor a seen row without its bundle). Previously the two DELETEs
+        // were un-enclosed and seen_rows was bumped only after the seen delete, so a mid-loop failure
+        // could drift the count and orphan a bundle; this asserts the transactional invariant.
+        let mut s = SqliteStore::open_in_memory().unwrap();
+        // A handful of REAL held bundles with the default (near) expiry (the eviction targets).
+        let mut real_ids = Vec::new();
+        for _ in 0..5 {
+            let b = sample(8);
+            real_ids.push(b.id());
+            s.put(b, 0);
+        }
+        // Stuff the seen table well past the cap with far-future expiries so the real bundles (nearer
+        // expiry) are the eviction victims.
+        {
+            let tx = s.conn.transaction().unwrap();
+            for i in 0..(MAX_SEEN_ROWS + 20) {
+                let mut fake = [0u8; 32];
+                fake[..8].copy_from_slice(&(i as u64 + 1).to_le_bytes());
+                fake[31] = 0xBB;
+                tx.execute(
+                    "INSERT OR IGNORE INTO seen (id, expires_at) VALUES (?1, ?2)",
+                    params![&fake[..], i64::MAX],
+                )
+                .unwrap();
+            }
+            tx.commit().unwrap();
+        }
+        // Re-seed the tracked count from the table (the direct INSERTs bypass put()'s bump).
+        let true_count = |s: &SqliteStore| -> i64 {
+            s.conn
+                .query_row("SELECT COUNT(*) FROM seen", [], |r| r.get::<_, i64>(0))
+                .unwrap()
+        };
+        s.seen_rows.set(true_count(&s));
+
+        s.enforce_seen_cap().unwrap();
+
+        // Invariant 1: the tracked count exactly matches the table after the transactional eviction.
+        assert_eq!(
+            s.seen_rows.get(),
+            true_count(&s),
+            "tracked seen_rows must equal COUNT(*) after a transactional eviction (no drift)"
+        );
+        assert_eq!(
+            true_count(&s),
+            MAX_SEEN_ROWS,
+            "seen table trimmed back to exactly the cap"
+        );
+        // Invariant 2: no held bundle is orphaned (every remaining held id still has a seen row).
+        let orphans: i64 = s
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM bundles b LEFT JOIN seen s ON b.id = s.id WHERE s.id IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(orphans, 0, "no held bundle left without its seen row");
+        // The real (near-expiry) bundles were the victims: gone from BOTH tables together.
+        for id in &real_ids {
+            assert!(!s.seen(id), "victim seen row evicted");
+            assert!(
+                !s.contains(id),
+                "victim held bundle evicted with its seen row"
+            );
+        }
+    }
+
+    #[test]
+    fn seen_cap_eviction_is_atomic_across_a_mid_loop_failure() {
+        // stores-r2-04 (the actual before/after): inject a failure on the SECOND (seen) DELETE so a
+        // victim's bundle DELETE lands but its seen DELETE errors mid-loop. The OLD code ran the two
+        // DELETEs OUTSIDE a transaction and bumped seen_rows only after the seen delete, so this left
+        // an orphaned bundle (deleted from `bundles`, still in `seen`) AND drifted the tracked count.
+        // The FIX wraps the loop in one transaction, so the failure rolls the bundle DELETE back too:
+        // no orphan, and seen_rows stays in step with the (unchanged) table.
+        let mut s = SqliteStore::open_in_memory().unwrap();
+        let mut real_ids = Vec::new();
+        for _ in 0..3 {
+            let b = sample(8);
+            real_ids.push(b.id());
+            s.put(b, 0);
+        }
+        {
+            let tx = s.conn.transaction().unwrap();
+            for i in 0..(MAX_SEEN_ROWS + 10) {
+                let mut fake = [0u8; 32];
+                fake[..8].copy_from_slice(&(i as u64 + 1).to_le_bytes());
+                fake[31] = 0xCC;
+                tx.execute(
+                    "INSERT OR IGNORE INTO seen (id, expires_at) VALUES (?1, ?2)",
+                    params![&fake[..], i64::MAX],
+                )
+                .unwrap();
+            }
+            tx.commit().unwrap();
+        }
+        let true_count = |s: &SqliteStore| -> i64 {
+            s.conn
+                .query_row("SELECT COUNT(*) FROM seen", [], |r| r.get::<_, i64>(0))
+                .unwrap()
+        };
+        s.seen_rows.set(true_count(&s));
+        let count_before = true_count(&s);
+        let held_before: i64 = s
+            .conn
+            .query_row("SELECT COUNT(*) FROM bundles", [], |r| r.get(0))
+            .unwrap();
+
+        // Fault injection: a trigger that aborts every DELETE FROM seen. With a single enclosing
+        // transaction the whole eviction (including the bundles DELETE) rolls back on this error.
+        s.conn
+            .execute_batch(
+                "CREATE TRIGGER fail_seen_delete BEFORE DELETE ON seen \
+                 BEGIN SELECT RAISE(ABORT, 'injected'); END;",
+            )
+            .unwrap();
+
+        let res = s.enforce_seen_cap();
+        assert!(res.is_err(), "the injected seen-delete failure surfaces");
+
+        // Remove the trigger so our assertions can read freely.
+        s.conn
+            .execute_batch("DROP TRIGGER fail_seen_delete;")
+            .unwrap();
+
+        // Atomicity: the failed eviction rolled back entirely, so table counts are UNCHANGED and no
+        // bundle was orphaned and the tracked count did not drift from the table.
+        assert_eq!(
+            true_count(&s),
+            count_before,
+            "seen count unchanged: the transaction rolled back the whole eviction"
+        );
+        let held_after: i64 = s
+            .conn
+            .query_row("SELECT COUNT(*) FROM bundles", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            held_after, held_before,
+            "no bundle DELETE leaked: bundles table unchanged after the rolled-back eviction"
+        );
+        let orphans: i64 = s
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM bundles b LEFT JOIN seen s ON b.id = s.id WHERE s.id IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            orphans, 0,
+            "no orphaned held bundle after the failed eviction"
+        );
+        for id in &real_ids {
+            assert!(s.contains(id), "victim bundle preserved by the rollback");
+            assert!(s.seen(id), "victim seen row preserved by the rollback");
+        }
+    }
+
+    #[cfg(feature = "sqlcipher")]
+    #[test]
+    fn migration_folds_and_clears_a_lingering_plaintext_wal() {
+        // stores-r2-02: the plaintext db runs in journal_mode=WAL (from_conn), so a device that was
+        // killed before a checkpoint leaves a REAL plaintext `-wal` with committed frames NOT yet
+        // folded into the main file, plus a `-shm`. The old migration opened the plaintext source,
+        // exported the MAIN FILE ONLY (missing the WAL-resident rows), and renamed just the main db
+        // over the destination, leaving the plaintext `-wal`/`-shm` orphaned next to the new
+        // SQLCipher db, where open_keyed re-enabling WAL can try to recover against a foreign WAL.
+        //
+        // The fix checkpoints + switches the source to journal_mode=DELETE before export, so the
+        // WAL-resident rows are folded in (captured by the encrypted export) and the sidecars are
+        // gone. This test creates that exact lingering-WAL state (a forgotten connection with
+        // autocheckpoint off) and proves both: (a) the WAL-only row survives into the encrypted db,
+        // and (b) no plaintext sidecar with real frames is left behind.
+        use rusqlite::Connection;
+        let tmp = std::env::temp_dir();
+        // Source db (where we build the lingering-WAL state) and the test target we migrate. We build
+        // the state on `src`, then COPY the three files to `path` so the target has a real plaintext
+        // WAL on disk with NO process holding an OS lock (mirrors a device snapshot after a crash).
+        let src = format!("{}/hop-migrate-lingering-src.db", tmp.display());
+        let path = format!("{}/hop-migrate-lingering-wal-test.db", tmp.display());
+        let cleanup = |base: &str| {
+            for suf in ["", "-wal", "-shm"] {
+                let _ = std::fs::remove_file(format!("{base}{suf}"));
+            }
+        };
+        cleanup(&src);
+        cleanup(&path);
+        let wal = format!("{path}-wal");
+        let shm = format!("{path}-shm");
+        let key = [3u8; 32];
+        let b = sample(9);
+        let id = b.id();
+        {
+            let mut plain = SqliteStore::open(&src).unwrap();
+            assert!(plain.put(b, 0)); // lands in the main file
+        }
+        // Raw connection: WAL, no autocheckpoint, write a kv row, then LEAK the connection so it never
+        // checkpoints. The row now lives only in `{src}-wal`.
+        {
+            let raw = Connection::open(&src).unwrap();
+            raw.execute_batch(
+                "PRAGMA journal_mode=WAL;
+                 PRAGMA wal_autocheckpoint=0;",
+            )
+            .unwrap();
+            raw.execute(
+                "INSERT OR REPLACE INTO kv (key, value) VALUES (?1, ?2)",
+                params!["session/wal-resident", &b"secret-ratchet-in-the-wal"[..]],
+            )
+            .unwrap();
+            std::mem::forget(raw); // no clean close -> WAL frames persist on disk for `src`
+        }
+        // Snapshot the three files onto the test target (releasing any lock, like process death would).
+        std::fs::copy(&src, &path).unwrap();
+        std::fs::copy(format!("{src}-wal"), &wal).unwrap();
+        let _ = std::fs::copy(format!("{src}-shm"), &shm); // -shm may be absent; fine
+        assert!(
+            std::fs::metadata(&wal)
+                .map(|m| m.len() > 0)
+                .unwrap_or(false),
+            "a real plaintext WAL with frames lingers on the target before migration"
+        );
+
+        let migrated = SqliteStore::migrate_plaintext_to_keyed(&path, &key).unwrap();
+        // (a) both the main-file bundle AND the WAL-resident kv row are captured in the encrypted db.
+        assert!(
+            migrated.contains(&id),
+            "main-file bundle survives the migration"
+        );
+        assert_eq!(
+            migrated.get_kv("session/wal-resident"),
+            Some(b"secret-ratchet-in-the-wal".to_vec()),
+            "the WAL-resident row was folded in and captured by the encrypted export"
+        );
+        drop(migrated);
+
+        // (b) no plaintext sidecar with the WAL-resident secret survives beside the encrypted db.
+        for p in [&wal, &shm] {
+            if let Ok(bytes) = std::fs::read(p) {
+                assert!(
+                    !bytes
+                        .windows(b"secret-ratchet-in-the-wal".len())
+                        .any(|w| w == b"secret-ratchet-in-the-wal"),
+                    "plaintext WAL-resident secret must not linger in sidecar {p}"
+                );
+            }
+        }
+        // And the encrypted db reopens cleanly with the key (no foreign-WAL recovery failure).
+        let reopened = SqliteStore::open_keyed(&path, &key).unwrap();
+        assert!(reopened.contains(&id), "keyed reopen reads cleanly");
+        assert!(
+            !SqliteStore::opens_as_plaintext(&path),
+            "db is genuinely SQLCipher-encrypted"
+        );
+        drop(reopened);
+        cleanup(&src);
+        cleanup(&path);
     }
 
     #[test]
