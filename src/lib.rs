@@ -452,6 +452,20 @@ impl Store for SqliteStore {
             let _ = self.write_data(id, &bundle);
         }
     }
+
+    fn seen_expiry(&self, id: &BundleId) -> Option<u64> {
+        // stores-r3-01: the durable, receiver-anchored dedup deadline for `id` (the clamped
+        // now+lifetime stamped at put time). Callers use this as the authoritative expiry for a
+        // handoff/spool re-mirror instead of the sender's advisory created_at.
+        self.conn
+            .query_row(
+                "SELECT expires_at FROM seen WHERE id = ?1",
+                params![&id[..]],
+                |row| row.get::<_, i64>(0),
+            )
+            .ok()
+            .map(|e| e as u64)
+    }
 }
 
 #[cfg(test)]
