@@ -11,7 +11,7 @@ hop-core.workspace = true
 # F-25: rusqlite is declared locally (not via the workspace dep) so its bundling can be feature-gated:
 # `bundled` = plain SQLite (default, fast build); `sqlcipher` = SQLite + SQLCipher (encrypted at rest,
 # keyed via `SqliteStore::open_keyed`), which vendors OpenSSL and needs a C toolchain + perl to build.
-rusqlite = { version = "0.32", default-features = false }
+rusqlite = { version = "0.40", default-features = false }
 # stores-12: zeroize the hex-formatted SQLCipher key material after the PRAGMA runs, so the
 # at-rest key does not linger in unzeroized heap allocations for the process lifetime.
 zeroize = "1"
