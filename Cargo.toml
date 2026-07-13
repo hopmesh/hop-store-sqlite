@@ -2,7 +2,7 @@
 name = "hop-store-sqlite"
 version.workspace = true
 edition.workspace = true
-license-file.workspace = true
+license-file = "LICENSE.md"
 repository.workspace = true
 description = "Persistent SQLite Store backend for Hop (DESIGN.md §13.2)."
 
