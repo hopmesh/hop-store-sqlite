@@ -329,6 +329,34 @@ impl Store for SqliteStore {
         result.is_ok()
     }
 
+    fn rehydrate(&mut self, bundle: Bundle, now_ms: u64) -> bool {
+        // relay-A audit: re-hold an evicted-but-durable bundle even though its `seen` row survives (a
+        // mailbox re-pull / handoff re-ingest). Same transactional write as put, but WITHOUT the seen
+        // gate: INSERT OR IGNORE keeps the existing dedup expiry, INSERT OR REPLACE re-holds the bundle.
+        let id = bundle.id();
+        let lifetime = (bundle.inner.lifetime_ms as u64).min(MAX_SEEN_LIFETIME_MS);
+        let expires_at = now_ms.saturating_add(lifetime);
+        let result = (|| -> rusqlite::Result<usize> {
+            let tx = self.conn.transaction()?;
+            let inserted = tx.execute(
+                "INSERT OR IGNORE INTO seen (id, expires_at) VALUES (?1, ?2)",
+                params![&id[..], expires_at as i64],
+            )?;
+            let data = bundle.to_bytes().map_err(to_sqlite_err)?;
+            tx.execute(
+                "INSERT OR REPLACE INTO bundles (id, data) VALUES (?1, ?2)",
+                params![&id[..], data],
+            )?;
+            tx.commit()?;
+            Ok(inserted)
+        })();
+        if let Ok(inserted) = result {
+            self.seen_rows.set(self.seen_rows.get() + inserted as i64);
+        }
+        let _ = self.enforce_seen_cap();
+        result.is_ok()
+    }
+
     fn get(&self, id: &BundleId) -> Option<Bundle> {
         self.conn
             .query_row(
