@@ -16,7 +16,7 @@
 //! with a 32-byte key from the platform Keychain/Keystore to encrypt every page at rest (DESIGN.md §13.2).
 
 use hop_core::bundle::{Bundle, BundleId};
-use hop_core::store::{HaveSet, Store};
+use hop_core::store::{HaveSet, KvMutation, Store};
 use rusqlite::{params, Connection};
 use zeroize::Zeroize;
 
@@ -436,10 +436,71 @@ impl Store for SqliteStore {
     }
 
     fn put_kv(&mut self, key: &str, value: Vec<u8>) {
-        let _ = self.conn.execute(
-            "INSERT OR REPLACE INTO kv (key, value) VALUES (?1, ?2)",
-            params![key, value],
-        );
+        let _ = self.put_kv_critical(key, value);
+    }
+
+    fn apply_kv_batch(&mut self, mutations: &[KvMutation]) -> std::result::Result<(), String> {
+        let bundle_puts = mutations
+            .iter()
+            .filter(|mutation| matches!(mutation, KvMutation::PutBundle { .. }))
+            .count() as i64;
+        if self.seen_rows.get().saturating_add(bundle_puts) > MAX_SEEN_ROWS {
+            return Err("critical batch would exceed SQLite bundle custody capacity".into());
+        }
+        let tx = self.conn.transaction().map_err(|e| e.to_string())?;
+        let mut inserted_seen = 0i64;
+        for mutation in mutations {
+            match mutation {
+                KvMutation::Put { key, value } => tx
+                    .execute(
+                        "INSERT OR REPLACE INTO kv (key, value) VALUES (?1, ?2)",
+                        params![key, value],
+                    )
+                    .map_err(|e| e.to_string())?,
+                KvMutation::Remove { key } => tx
+                    .execute("DELETE FROM kv WHERE key = ?1", params![key])
+                    .map_err(|e| e.to_string())?,
+                KvMutation::PutBundle { bundle, now_ms } => {
+                    let id = bundle.id();
+                    let lifetime = (bundle.inner.lifetime_ms as u64).min(MAX_SEEN_LIFETIME_MS);
+                    let expires_at = now_ms.saturating_add(lifetime);
+                    let inserted = tx
+                        .execute(
+                            "INSERT OR IGNORE INTO seen (id, expires_at) VALUES (?1, ?2)",
+                            params![&id[..], expires_at as i64],
+                        )
+                        .map_err(|e| e.to_string())?;
+                    if inserted == 0 {
+                        return Err("critical batch bundle put was deduplicated".into());
+                    }
+                    let data = bundle.to_bytes().map_err(|e| e.to_string())?;
+                    tx.execute(
+                        "INSERT INTO bundles (id, data) VALUES (?1, ?2)",
+                        params![&id[..], data],
+                    )
+                    .map_err(|e| e.to_string())?;
+                    inserted_seen += 1;
+                    inserted
+                }
+                KvMutation::RemoveBundle { id } => tx
+                    .execute("DELETE FROM bundles WHERE id = ?1", params![&id[..]])
+                    .map_err(|e| e.to_string())?,
+            };
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+        self.seen_rows
+            .set(self.seen_rows.get().saturating_add(inserted_seen));
+        Ok(())
+    }
+
+    fn put_kv_critical(&mut self, key: &str, value: Vec<u8>) -> std::result::Result<(), String> {
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO kv (key, value) VALUES (?1, ?2)",
+                params![key, value],
+            )
+            .map(|_| ())
+            .map_err(|e| e.to_string())
     }
 
     fn get_kv(&self, key: &str) -> Option<Vec<u8>> {
@@ -451,23 +512,37 @@ impl Store for SqliteStore {
     }
 
     fn remove_kv(&mut self, key: &str) {
-        let _ = self
-            .conn
-            .execute("DELETE FROM kv WHERE key = ?1", params![key]);
+        let _ = self.remove_kv_critical(key);
     }
 
-    fn list_kv(&self, prefix: &str) -> Vec<(String, Vec<u8>)> {
-        // `prefix%` with the LIKE wildcard; prefixes here are fixed ("session/"), no escaping.
-        let pattern = format!("{prefix}%");
-        let Ok(mut stmt) = self
-            .conn
-            .prepare("SELECT key, value FROM kv WHERE key LIKE ?1")
-        else {
+    fn remove_kv_critical(&mut self, key: &str) -> std::result::Result<(), String> {
+        self.conn
+            .execute("DELETE FROM kv WHERE key = ?1", params![key])
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    fn list_kv_page(
+        &self,
+        prefix: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Vec<(String, Vec<u8>)> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        let after = after.unwrap_or("");
+        let Ok(mut stmt) = self.conn.prepare(
+            "SELECT key, value FROM kv
+                 WHERE substr(key, 1, length(?1)) = ?1 AND key > ?2
+                 ORDER BY key ASC LIMIT ?3",
+        ) else {
             return Vec::new();
         };
-        let rows = stmt.query_map(params![pattern], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
-        });
+        let rows = stmt.query_map(
+            params![prefix, after, limit.min(i64::MAX as usize) as i64],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?)),
+        );
         match rows {
             Ok(it) => it.filter_map(|r| r.ok()).collect(),
             Err(_) => Vec::new(),
@@ -556,6 +631,91 @@ mod tests {
 
         s.set_copies(&id, 8); // retransmit reset
         assert_eq!(s.get(&id).unwrap().env.copies, 8);
+    }
+
+    #[test]
+    fn critical_kv_operations_return_the_sqlite_write_error() {
+        let mut s = SqliteStore::open_in_memory().unwrap();
+        s.conn.execute_batch("DROP TABLE kv").unwrap();
+
+        let put = s
+            .put_kv_critical("session/alice", vec![1])
+            .expect_err("missing kv table must fail");
+        assert!(put.contains("no such table"), "real SQLite error: {put}");
+
+        let remove = s
+            .remove_kv_critical("session/alice")
+            .expect_err("missing kv table must fail");
+        assert!(
+            remove.contains("no such table"),
+            "real SQLite error: {remove}"
+        );
+    }
+
+    #[test]
+    fn critical_kv_batch_rolls_back_every_key_on_failure() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        store.put_kv_critical("session/alice", vec![1]).unwrap();
+        store
+            .conn
+            .execute_batch(
+                "CREATE TRIGGER fail_inbox BEFORE INSERT ON kv
+                 WHEN NEW.key = 'inbox/fail'
+                 BEGIN SELECT RAISE(ABORT, 'injected inbox failure'); END;",
+            )
+            .unwrap();
+
+        let result = store.apply_kv_batch(&[
+            KvMutation::Put {
+                key: "session/alice".into(),
+                value: vec![2],
+            },
+            KvMutation::Put {
+                key: "inbox/fail".into(),
+                value: vec![3],
+            },
+            KvMutation::Put {
+                key: "inbox-seen/fail".into(),
+                value: vec![4],
+            },
+        ]);
+
+        assert!(result.is_err());
+        assert_eq!(store.get_kv("session/alice"), Some(vec![1]));
+        assert_eq!(store.get_kv("inbox/fail"), None);
+        assert_eq!(store.get_kv("inbox-seen/fail"), None);
+    }
+
+    #[test]
+    fn mixed_bundle_and_session_batch_rolls_back_when_the_second_mutation_fails() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        store
+            .conn
+            .execute_batch(
+                "CREATE TRIGGER fail_session BEFORE INSERT ON kv
+                 WHEN NEW.key = 'session/fail'
+                 BEGIN SELECT RAISE(ABORT, 'injected session failure'); END;",
+            )
+            .unwrap();
+        let bundle = sample(8);
+        let id = bundle.id();
+
+        let result = store.apply_kv_batch(&[
+            KvMutation::PutBundle {
+                bundle: Box::new(bundle),
+                now_ms: 1_000,
+            },
+            KvMutation::Put {
+                key: "session/fail".into(),
+                value: vec![1, 2, 3],
+            },
+        ]);
+
+        assert!(result.is_err(), "the injected second mutation must fail");
+        assert!(!store.contains(&id), "bundle insert rolled back");
+        assert!(!store.seen(&id), "seen insert rolled back with custody");
+        assert_eq!(store.get_kv("session/fail"), None);
+        assert_eq!(store.seen_rows.get(), 0, "tracked seen count did not drift");
     }
 
     #[test]
