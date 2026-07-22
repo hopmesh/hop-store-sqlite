@@ -1,16 +1,16 @@
 //! # hop-store-sqlite
 //!
 //! A persistent [`Store`](hop_core::store::Store) backend for Hop, on SQLite via
-//! `rusqlite` (bundled) — the decided backend in DESIGN.md §13.2. Survives
+//! `rusqlite` (bundled), the decided backend in DESIGN.md §13.2. Survives
 //! restarts, dedups across them, and supports the spray-and-wait copy mutations.
 //!
 //! Two tables: `bundles(id, data)` holds the currently-held bundles (postcard
-//! encoded), and `seen(id)` is the dedup set — retained after a bundle is removed
+//! encoded), and `seen(id)` is the dedup set, retained after a bundle is removed
 //! so a re-offered duplicate is still rejected. The copy budget lives inside the
 //! encoded `data` (re-encoded on mutation) so a read always reflects current state.
 //!
 //! Encryption at rest (F-25): available via the `sqlcipher` cargo feature + [`SqliteStore::open_keyed`].
-//! The default build uses plain `bundled` SQLite (cleartext on disk — ratchet keys, hps content keys,
+//! The default build uses plain `bundled` SQLite (cleartext on disk, ratchet keys, hps content keys,
 //! queued message bodies), so a plain-feature build must still rely on iOS file protection + the app
 //! sandbox. Build with `--features sqlcipher` (SQLite + SQLCipher, vendored OpenSSL) and open the store
 //! with a 32-byte key from the platform Keychain/Keystore to encrypt every page at rest (DESIGN.md §13.2).
@@ -51,9 +51,9 @@ impl Drop for HexKey {
 
 /// Hard cap on how long a `seen` dedup row is retained, regardless of a bundle's claimed
 /// `lifetime_ms` (F-07). The field is attacker-controlled (a `u32` ms, ~49 days max) and, for an
-/// unsigned §39 private bundle, unauthenticated — so a flood of long-lived ids could bloat the
+/// unsigned §39 private bundle, unauthenticated, so a flood of long-lived ids could bloat the
 /// dedup set for weeks. We clamp the retained window to a week; a duplicate past that is re-accepted
-/// (harmless — it re-floods and is re-deduped) but the table cannot be pinned open indefinitely.
+/// (harmless: it re-floods and is re-deduped) but the table cannot be pinned open indefinitely.
 const MAX_SEEN_LIFETIME_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 
 /// Row cap on the `seen` dedup table (F-07). Past this we evict the nearest-to-expiry rows so a
@@ -209,10 +209,10 @@ impl SqliteStore {
         }
         // Performance-critical: the node holds its single Mutex across every store write, so each
         // write's fsync stalls ALL node processing (link Noise handshakes, prekey gossip, sends).
-        // The default journal_mode=DELETE + synchronous=FULL does an fsync per statement — under
+        // The default journal_mode=DELETE + synchronous=FULL does an fsync per statement, under
         // multi-peer BLE load that fsync storm jams the serial executor and links never reach Up,
         // so prekeys never exchange and messages hang "Securing" forever. WAL + synchronous=NORMAL
-        // keeps durability (survives app crash; only loses the last commits on an OS/power crash —
+        // keeps durability (survives app crash; only loses the last commits on an OS/power crash,
         // acceptable for a store-and-forward cache) while removing the per-write fsync. busy_timeout
         // lets a reader wait out a concurrent writer instead of erroring. (No-op on :memory: tests.)
         conn.execute_batch(
@@ -848,7 +848,7 @@ mod tests {
     #[cfg(feature = "sqlcipher")]
     #[test]
     fn sqlcipher_encrypts_at_rest() {
-        // F-25: with the sqlcipher feature, a keyed store is unreadable without the key — proving the
+        // F-25: with the sqlcipher feature, a keyed store is unreadable without the key, proving the
         // pages are actually encrypted on disk (a plain or wrong-key open fails to even read the schema).
         let path = format!("{}/hop-sqlcipher-test.db", std::env::temp_dir().display());
         let _ = std::fs::remove_file(&path);
@@ -895,7 +895,7 @@ mod tests {
         assert!(migrated.contains(&id), "data survives the migration");
         assert!(
             SqliteStore::open(&path).is_err(),
-            "after migration a plain open fails — it is now SQLCipher-encrypted"
+            "after migration a plain open fails: it is now SQLCipher-encrypted"
         );
         assert!(
             !SqliteStore::opens_as_plaintext(&path),
