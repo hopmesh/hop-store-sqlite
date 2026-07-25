@@ -64,8 +64,9 @@ hop-store-sqlite = { version = "0.0", default-features = false, features = ["sql
   the dedup set, retained after a bundle is removed so a re-offered duplicate is still rejected.
 - **Flood-bounded dedup.** The `seen` set is clamped in both retained lifetime and row count, so an
   unauthenticated §39 bundle flood can't pin the table open or grow it without bound.
-- **Copy budget in the row.** The spray-and-wait copy count lives in the encoded `data` and is
-  re-encoded on mutation, so a read always reflects current state.
+- **Reserved copy budget in the row.** `Envelope.copies` lives in the encoded `data` and must survive a
+  round trip byte-exactly. It is reserved wire capacity that routing ignores (DESIGN.md §6), not a budget
+  this store mutates; the `split_copies` / `set_copies` mutation API was deleted.
 - **Default is plaintext on disk.** The `bundled` default build stores cleartext; a plaintext build must
   still rely on OS file protection. Build with `sqlcipher` and a real key to encrypt (DESIGN.md §13.2).
 

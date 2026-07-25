@@ -2,12 +2,13 @@
 //!
 //! A persistent [`Store`](hop_core::store::Store) backend for Hop, on SQLite via
 //! `rusqlite` (bundled), the decided backend in DESIGN.md §13.2. Survives
-//! restarts, dedups across them, and supports the spray-and-wait copy mutations.
+//! restarts and dedups across them.
 //!
 //! Two tables: `bundles(id, data)` holds the currently-held bundles (postcard
 //! encoded), and `seen(id)` is the dedup set, retained after a bundle is removed
-//! so a re-offered duplicate is still rejected. The copy budget lives inside the
-//! encoded `data` (re-encoded on mutation) so a read always reflects current state.
+//! so a re-offered duplicate is still rejected. `Envelope.copies` rides inside the encoded
+//! `data` and must round-trip byte-exactly: it is reserved wire capacity that routing ignores
+//! (DESIGN.md §6), not a budget this store mutates.
 //!
 //! Encryption at rest (F-25): available via the `sqlcipher` cargo feature + [`SqliteStore::open_keyed`].
 //! The default build uses plain `bundled` SQLite (cleartext on disk, ratchet keys, hps content keys,
