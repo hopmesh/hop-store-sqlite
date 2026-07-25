@@ -22,7 +22,7 @@ Wi-Fi, and the internet, until they reach the person you meant. Held, never drop
 
 `hop-store-sqlite` is one implementation of `hop-core`'s `Store` trait: the held-bundle mailbox and the
 dedup set on SQLite via `rusqlite`. It survives restarts, dedups across them, and supports the
-spray-and-wait copy budget. It's what a device or a self-hosted node keeps its state in.
+reserved copy field, round-tripped byte-exactly. It's what a device or a self-hosted node keeps its state in.
 
 ## Install
 

@@ -277,15 +277,6 @@ impl SqliteStore {
         }
         Ok(())
     }
-
-    fn write_data(&self, id: &BundleId, bundle: &Bundle) -> rusqlite::Result<()> {
-        let data = bundle.to_bytes().map_err(to_sqlite_err)?;
-        self.conn.execute(
-            "INSERT OR REPLACE INTO bundles (id, data) VALUES (?1, ?2)",
-            params![&id[..], data],
-        )?;
-        Ok(())
-    }
 }
 
 fn to_sqlite_err<E: std::error::Error + Send + Sync + 'static>(e: E) -> rusqlite::Error {
@@ -424,17 +415,6 @@ impl Store for SqliteStore {
         }
     }
 
-    fn split_copies(&mut self, id: &BundleId) -> u16 {
-        let Some(mut bundle) = self.get(id) else {
-            return 0;
-        };
-        let give = bundle.split_copies();
-        if give > 0 {
-            let _ = self.write_data(id, &bundle);
-        }
-        give
-    }
-
     fn put_kv(&mut self, key: &str, value: Vec<u8>) {
         let _ = self.put_kv_critical(key, value);
     }
@@ -549,13 +529,6 @@ impl Store for SqliteStore {
         }
     }
 
-    fn set_copies(&mut self, id: &BundleId, copies: u16) {
-        if let Some(mut bundle) = self.get(id) {
-            bundle.env.copies = copies;
-            let _ = self.write_data(id, &bundle);
-        }
-    }
-
     fn seen_expiry(&self, id: &BundleId) -> Option<u64> {
         // stores-r3-01: the durable, receiver-anchored dedup deadline for `id` (the clamped
         // now+lifetime stamped at put time). Callers use this as the authoritative expiry for a
@@ -618,19 +591,21 @@ mod tests {
     }
 
     #[test]
-    fn copy_budget_mutations_persist() {
+    fn reserved_copy_budget_survives_a_store_round_trip() {
+        // `Envelope.copies` is RESERVED wire capacity for a future routing policy (DESIGN.md §6):
+        // the shipped router is epidemic + vaccine and never reads it. The mutation API that used
+        // to drive it (Store::split_copies / set_copies) was removed as dead surface imposed on
+        // every Store implementor. The FIELD stays, so this pins the one property that still has
+        // to hold: a store must round-trip it byte-exactly rather than normalizing it away.
         let mut s = SqliteStore::open_in_memory().unwrap();
         let b = sample(8);
         let id = b.id();
         s.put(b, 0);
-
-        assert_eq!(s.split_copies(&id), 4); // 8 -> keep 4, give 4
-        assert_eq!(s.get(&id).unwrap().env.copies, 4);
-        assert_eq!(s.split_copies(&id), 2); // 4 -> keep 2, give 2
-        assert_eq!(s.get(&id).unwrap().env.copies, 2);
-
-        s.set_copies(&id, 8); // retransmit reset
-        assert_eq!(s.get(&id).unwrap().env.copies, 8);
+        assert_eq!(
+            s.get(&id).unwrap().env.copies,
+            8,
+            "a store must not silently drop or rewrite reserved envelope state"
+        );
     }
 
     #[test]
