@@ -18,6 +18,7 @@ git-cliff. Do not edit by hand.
 - land the grouped rust-dependencies bump (sha2, ed25519/x25519-dalek, chacha20poly1305, snow, rusqlite, p256, uniffi, tungstenite) (#89) (2038ce9)
 
 ### Documentation
+- regenerate from conventional commits (a355901)
 - branded, marketable READMEs for every sub-repo (9c2a477)
 
 ### Features
@@ -25,6 +26,8 @@ git-cliff. Do not edit by hand.
 - auto-generate monorepo + per-library changelogs (git-cliff) (8c64c37)
 
 ### Other
+- delete unwired trait surface and correct 12 stale claims (4e4272f)
+- delete the dead copy-budget API and stop the simulator lying (9ab3138)
 - publish the Rust crates under the hop-mesh-* namespace (3bb9d0c)
 - CLA gate on contributions (preserve commercial relicensing of core) (5a9aa7d)
 - SECURITY.md per component + enable-security in the bootstrap script (a1492e9)
