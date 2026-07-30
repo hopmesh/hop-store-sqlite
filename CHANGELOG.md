@@ -18,6 +18,7 @@ git-cliff. Do not edit by hand.
 - land the grouped rust-dependencies bump (sha2, ed25519/x25519-dalek, chacha20poly1305, snow, rusqlite, p256, uniffi, tungstenite) (#89) (2038ce9)
 
 ### Documentation
+- regenerate from conventional commits (b96e019)
 - regenerate from conventional commits (330c8c6)
 - regenerate from conventional commits (096180b)
 - regenerate from conventional commits (102ae67)
@@ -31,6 +32,7 @@ git-cliff. Do not edit by hand.
 - auto-generate monorepo + per-library changelogs (git-cliff) (8c64c37)
 
 ### Other
+- bump our crates in every standalone/vendored Cargo.lock (aad3ff7)
 - delete unwired trait surface and correct 12 stale claims (4e4272f)
 - delete the dead copy-budget API and stop the simulator lying (9ab3138)
 - publish the Rust crates under the hop-mesh-* namespace (3bb9d0c)
